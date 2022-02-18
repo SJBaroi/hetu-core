@@ -411,7 +411,7 @@ public class Driver
                 }
 
                 // skip blocked operator
-                if (!(current instanceof CommonTableExpressionOperator) && getBlockedFuture(current).isPresent()) {
+                if (!(current instanceof CommonTableExpressionOperator || current instanceof OrderByOperator) && getBlockedFuture(current).isPresent()) {
                     continue;
                 }
 

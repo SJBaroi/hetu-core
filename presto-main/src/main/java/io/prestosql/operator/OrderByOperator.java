@@ -148,6 +148,8 @@ public class OrderByOperator
     private enum State
     {
         NEEDS_INPUT,
+        SECONDAY_INPUT,
+        BLOCKED,
         HAS_OUTPUT,
         FINISHED
     }
@@ -159,8 +161,10 @@ public class OrderByOperator
     private final int[] outputChannels;
     private final LocalMemoryContext revocableMemoryContext;
     private final LocalMemoryContext localUserMemoryContext;
+    private final LocalMemoryContext secondaryRevocableMemoryContext;
 
     private final PagesIndex pageIndex;
+    private final PagesIndex secondaryPageIndex;
 
     private final List<Type> sourceTypes;
 
@@ -170,6 +174,7 @@ public class OrderByOperator
 
     private Optional<Spiller> spiller = Optional.empty();
     private ListenableFuture<?> spillInProgress = immediateFuture(null);
+    private ListenableFuture<?> spillInProgress2 = immediateFuture(null);
     private Runnable finishMemoryRevoke = () -> {};
 
     private Iterator<Optional<Page>> sortedPages;
@@ -199,8 +204,10 @@ public class OrderByOperator
         this.sourceTypes = ImmutableList.copyOf(requireNonNull(sourceTypes, "sourceTypes is null"));
         this.localUserMemoryContext = operatorContext.localUserMemoryContext();
         this.revocableMemoryContext = operatorContext.localRevocableMemoryContext();
+        this.secondaryRevocableMemoryContext = operatorContext.localRevocableMemoryContext();
 
         this.pageIndex = pagesIndexFactory.newPagesIndex(sourceTypes, expectedPositions);
+        this.secondaryPageIndex = pagesIndexFactory.newPagesIndex(sourceTypes, expectedPositions);
         this.spillEnabled = spillEnabled;
         this.spillerFactory = requireNonNull(spillerFactory, "spillerFactory is null");
         this.orderingCompiler = requireNonNull(orderingCompiler, "orderingCompiler is null");
@@ -220,7 +227,7 @@ public class OrderByOperator
         if (!spillInProgress.isDone()) {
             return;
         }
-        checkSuccess(spillInProgress, "spilling failed");
+//        checkSuccess(spillInProgress, "spilling failed");
 
         if (state == State.NEEDS_INPUT) {
             state = State.HAS_OUTPUT;
@@ -273,9 +280,9 @@ public class OrderByOperator
     @Override
     public void addInput(Page page)
     {
-        checkState(state == State.NEEDS_INPUT, "Operator is already finishing");
+        checkState(state == State.NEEDS_INPUT || state == State.SECONDAY_INPUT, "Operator is already finishing");
         requireNonNull(page, "page is null");
-        checkSuccess(spillInProgress, "spilling failed");
+//        checkSuccess(spillInProgress, "spilling failed");
 
         if (snapshotState != null) {
             if (snapshotState.processPage(page)) {
@@ -283,7 +290,12 @@ public class OrderByOperator
             }
         }
 
-        pageIndex.addPage(page);
+        if (state == State.SECONDAY_INPUT) {
+            secondaryPageIndex.addPage(page);
+        }
+        else {
+            pageIndex.addPage(page);
+        }
         updateMemoryUsage();
     }
 
@@ -291,6 +303,7 @@ public class OrderByOperator
     public Page getOutput()
     {
         checkSuccess(spillInProgress, "spilling failed");
+        checkSuccess(spillInProgress2, "spilling failed");
 
         if (snapshotState != null) {
             Page marker = snapshotState.nextMarker();
@@ -336,7 +349,7 @@ public class OrderByOperator
 
     private ListenableFuture<?> spillToDisk()
     {
-        checkSuccess(spillInProgress, "spilling failed");
+//        checkSuccess(spillInProgress, "spilling failed");
 
         if (revocableMemoryContext.getBytes() == 0) {
             verify(pageIndex.getPositionCount() == 0 || state == State.HAS_OUTPUT);
@@ -353,15 +366,29 @@ public class OrderByOperator
                     operatorContext.newAggregateSystemMemoryContext()));
         }
 
-        pageIndex.sort(sortChannels, sortOrder);
-        spillInProgress = spiller.get().spill(pageIndex.getSortedPages());
-        LOG.debug("spilling to disk initiated by Order by operator");
-        finishMemoryRevoke = () -> {
-            pageIndex.clear();
-            updateMemoryUsage();
-        };
-
-        return spillInProgress;
+        if (state == State.SECONDAY_INPUT) {
+            secondaryPageIndex.sort(sortChannels, sortOrder);
+            state = State.BLOCKED;
+            spillInProgress2 = spiller.get().spill(secondaryPageIndex.getSortedPages());
+            finishMemoryRevoke = () -> {
+                secondaryPageIndex.clear();
+                updateMemoryUsage();
+                checkFuturesAndSetState();
+            };
+            return spillInProgress2;
+        }
+        else {
+            pageIndex.sort(sortChannels, sortOrder);
+            spillInProgress = spiller.get().spill(pageIndex.getSortedPages());
+            state = State.SECONDAY_INPUT;
+            LOG.debug("spilling to disk initiated by Order by operator");
+            finishMemoryRevoke = () -> {
+                pageIndex.clear();
+                updateMemoryUsage();
+                checkFuturesAndSetState();
+            };
+            return spillInProgress;
+        }
     }
 
     @Override
@@ -407,6 +434,14 @@ public class OrderByOperator
             else {
                 localUserMemoryContext.setBytes(0);
                 revocableMemoryContext.setBytes(pageIndex.getEstimatedSize().toBytes());
+            }
+        }
+        else if (spillEnabled && state == State.SECONDAY_INPUT) {
+            if (secondaryPageIndex.getPositionCount() == 0) {
+                secondaryRevocableMemoryContext.setBytes(0);
+            }
+            else {
+                secondaryRevocableMemoryContext.setBytes(secondaryPageIndex.getEstimatedSize().toBytes());
             }
         }
         else {
@@ -498,4 +533,41 @@ public class OrderByOperator
 
         private Object spiller;
     }
+
+    private void checkFuturesAndSetState ()
+    {
+        if (!spillInProgress.isDone() && !spillInProgress2.isDone()) {
+            state = State.BLOCKED;
+        }
+        else if (spillInProgress.isDone() && !spillInProgress2.isDone()) {
+            state = State.NEEDS_INPUT;
+        }
+        else if (spillInProgress2.isDone() && !spillInProgress.isDone()) {
+            state = State.SECONDAY_INPUT;
+        }
+        else {
+            if (state.equals(State.HAS_OUTPUT)) {
+                state = State.HAS_OUTPUT;
+            }
+            else if (state.equals(State.SECONDAY_INPUT)) {
+                // copy pages from secondaryPagesIndex into pageIndex
+                copyPages();
+                secondaryPageIndex.clear();
+                state = State.NEEDS_INPUT;
+                updateMemoryUsage();
+            }
+            else {
+                state = State.NEEDS_INPUT;
+            }
+        }
+    }
+
+    private void copyPages()
+    {
+        Iterator<Page> pageIterator = secondaryPageIndex.getPages();
+        while (pageIterator.hasNext()) {
+            pageIndex.addPage(pageIterator.next());
+        }
+    }
+
 }
